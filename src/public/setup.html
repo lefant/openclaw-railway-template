@@ -63,6 +63,25 @@
   </div>
 
   <div class="card">
+    <h2>Config Editor</h2>
+    <p class="muted">Edit openclaw.json directly. Automatic backups are created before saving. Gateway restarts automatically after save.</p>
+    
+    <div class="muted" style="margin-bottom: 0.5rem">
+      Config file: <code id="configPath">Loading...</code>
+    </div>
+    
+    <label>JSON Configuration</label>
+    <textarea id="configContent" style="font-family: 'Monaco', 'Menlo', 'Consolas', monospace; font-size: 12px; height: 260px; resize: vertical;"></textarea>
+    
+    <div style="display: flex; gap: 0.5rem; margin-top: 0.5rem;">
+      <button id="configReload">Reload from disk</button>
+      <button id="configSave">Save & restart gateway</button>
+    </div>
+    
+    <pre id="configOutput" style="margin-top: 1rem; max-height: 200px; overflow-y: auto; background: #f5f5f5; padding: 0.75rem; border-radius: 4px;"></pre>
+  </div>
+
+  <div class="card">
     <h2>1) Model/auth provider</h2>
     <p class="muted">Matches the groups shown in the terminal onboarding.</p>
     <label>Provider group</label>
@@ -113,6 +132,15 @@
     <button id="reset" class="tertiary-button">Reset setup</button>
     <pre id="log"></pre>
     <p class="muted">Reset deletes the Openclaw config file so you can rerun onboarding. Pairing approval lets you grant DM access when dmPolicy=pairing.</p>
+    
+    <details style="margin-top: 1rem;">
+      <summary style="cursor: pointer; font-weight: bold;">Device Pairing Helper</summary>
+      <div style="margin-top: 0.75rem;">
+        <p class="muted">Approve pending device connection requests when using device pairing authentication.</p>
+        <button id="devicesRefresh">Refresh pending devices</button>
+        <div id="devicesList" style="margin-top: 0.75rem;"></div>
+      </div>
+    </details>
   </div>
 
   <script src="/setup/app.js"></script>

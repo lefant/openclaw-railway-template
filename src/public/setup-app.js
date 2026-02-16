@@ -199,5 +199,243 @@
     }
   };
 
+  // ========== CONFIG EDITOR ==========
+  var configPathEl = document.getElementById('configPath');
+  var configContentEl = document.getElementById('configContent');
+  var configReloadBtn = document.getElementById('configReload');
+  var configSaveBtn = document.getElementById('configSave');
+  var configOutputEl = document.getElementById('configOutput');
+
+  function loadConfig() {
+    configOutputEl.textContent = 'Loading config...';
+    configReloadBtn.disabled = true;
+    configSaveBtn.disabled = true;
+
+    fetch('/setup/api/config/raw', {
+      method: 'GET',
+      credentials: 'same-origin'
+    })
+      .then(function (res) {
+        return res.text().then(function (text) {
+          return { status: res.status, text: text };
+        });
+      })
+      .then(function (result) {
+        var j;
+        try {
+          j = JSON.parse(result.text);
+        } catch (_e) {
+          j = { ok: false, error: result.text };
+        }
+
+        if (j.ok) {
+          configPathEl.textContent = j.path || 'Unknown';
+          configContentEl.value = j.content || '';
+          if (j.exists) {
+            configOutputEl.textContent = 'Config loaded successfully';
+          } else {
+            configOutputEl.textContent = 'Config file does not exist yet. Run onboarding first.';
+          }
+        } else {
+          configOutputEl.textContent = 'Error: ' + (j.error || 'Unknown error');
+        }
+
+        configReloadBtn.disabled = false;
+        configSaveBtn.disabled = false;
+      })
+      .catch(function (e) {
+        configOutputEl.textContent = 'Error: ' + String(e);
+        configReloadBtn.disabled = false;
+        configSaveBtn.disabled = false;
+      });
+  }
+
+  function saveConfig() {
+    var content = configContentEl.value;
+
+    configOutputEl.textContent = 'Saving config...';
+    configReloadBtn.disabled = true;
+    configSaveBtn.disabled = true;
+    configSaveBtn.textContent = 'Saving...';
+
+    fetch('/setup/api/config/raw', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ content: content })
+    })
+      .then(function (res) {
+        return res.text().then(function (text) {
+          return { status: res.status, text: text };
+        });
+      })
+      .then(function (result) {
+        var j;
+        try {
+          j = JSON.parse(result.text);
+        } catch (_e) {
+          j = { ok: false, error: result.text };
+        }
+
+        if (j.ok) {
+          configOutputEl.textContent = 'Success: ' + (j.message || 'Config saved') + '\n' + (j.restartOutput || '');
+        } else {
+          configOutputEl.textContent = 'Error: ' + (j.error || 'Unknown error');
+        }
+
+        configReloadBtn.disabled = false;
+        configSaveBtn.disabled = false;
+        configSaveBtn.textContent = 'Save & restart gateway';
+      })
+      .catch(function (e) {
+        configOutputEl.textContent = 'Error: ' + String(e);
+        configReloadBtn.disabled = false;
+        configSaveBtn.disabled = false;
+        configSaveBtn.textContent = 'Save & restart gateway';
+      });
+  }
+
+  if (configReloadBtn) {
+    configReloadBtn.onclick = loadConfig;
+  }
+
+  if (configSaveBtn) {
+    configSaveBtn.onclick = saveConfig;
+  }
+
+  // Auto-load config on page load
+  loadConfig();
+
+  // ========== DEVICE PAIRING HELPER ==========
+  var devicesRefreshBtn = document.getElementById('devicesRefresh');
+  var devicesListEl = document.getElementById('devicesList');
+
+  function refreshDevices() {
+    if (!devicesListEl) return;
+
+    devicesListEl.innerHTML = '<p class="muted">Loading...</p>';
+    if (devicesRefreshBtn) {
+      devicesRefreshBtn.disabled = true;
+      devicesRefreshBtn.textContent = 'Loading...';
+    }
+
+    fetch('/setup/api/devices/pending', {
+      method: 'GET',
+      credentials: 'same-origin'
+    })
+      .then(function (res) {
+        return res.text().then(function (text) {
+          return { status: res.status, text: text };
+        });
+      })
+      .then(function (result) {
+        var j;
+        try {
+          j = JSON.parse(result.text);
+        } catch (_e) {
+          j = { ok: false, error: result.text };
+        }
+
+        if (j.ok) {
+          if (j.requestIds && j.requestIds.length > 0) {
+            var html = '<p class="muted">Found ' + j.requestIds.length + ' pending device(s):</p>';
+            html += '<ul style="list-style: none; padding: 0;">';
+            for (var i = 0; i < j.requestIds.length; i++) {
+              var reqId = j.requestIds[i];
+              html += '<li id="device-' + reqId + '" style="padding: 0.5rem; margin-bottom: 0.5rem; background: #f5f5f5; border-radius: 4px;">';
+              html += '<code style="font-weight: bold;">' + reqId + '</code> ';
+              html += '<button class="approve-device" data-requestid="' + reqId + '" style="margin-left: 0.5rem;">Approve</button>';
+              html += '</li>';
+            }
+            html += '</ul>';
+            html += '<details style="margin-top: 0.75rem;"><summary style="cursor: pointer;">Show raw output</summary>';
+            html += '<pre style="margin-top: 0.5rem; background: #f5f5f5; padding: 0.5rem; border-radius: 4px; font-size: 11px; max-height: 200px; overflow-y: auto;">' + (j.output || '(no output)') + '</pre>';
+            html += '</details>';
+            devicesListEl.innerHTML = html;
+
+            // Attach click handlers to approve buttons
+            var approveButtons = devicesListEl.querySelectorAll('.approve-device');
+            for (var k = 0; k < approveButtons.length; k++) {
+              approveButtons[k].onclick = function (e) {
+                var btn = e.target;
+                var reqId = btn.getAttribute('data-requestid');
+                approveDevice(reqId, btn);
+              };
+            }
+          } else {
+            devicesListEl.innerHTML = '<p class="muted">No pending devices found.</p>';
+            if (j.output) {
+              devicesListEl.innerHTML += '<details style="margin-top: 0.5rem;"><summary style="cursor: pointer;">Show raw output</summary>';
+              devicesListEl.innerHTML += '<pre style="margin-top: 0.5rem; background: #f5f5f5; padding: 0.5rem; border-radius: 4px; font-size: 11px; max-height: 200px; overflow-y: auto;">' + j.output + '</pre>';
+              devicesListEl.innerHTML += '</details>';
+            }
+          }
+        } else {
+          devicesListEl.innerHTML = '<p style="color: #d32f2f;">Error: ' + (j.error || j.output || 'Unknown error') + '</p>';
+        }
+
+        if (devicesRefreshBtn) {
+          devicesRefreshBtn.disabled = false;
+          devicesRefreshBtn.textContent = 'Refresh pending devices';
+        }
+      })
+      .catch(function (e) {
+        devicesListEl.innerHTML = '<p style="color: #d32f2f;">Error: ' + String(e) + '</p>';
+        if (devicesRefreshBtn) {
+          devicesRefreshBtn.disabled = false;
+          devicesRefreshBtn.textContent = 'Refresh pending devices';
+        }
+      });
+  }
+
+  function approveDevice(requestId, buttonEl) {
+    buttonEl.disabled = true;
+    buttonEl.textContent = 'Approving...';
+
+    fetch('/setup/api/devices/approve', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ requestId: requestId })
+    })
+      .then(function (res) {
+        return res.text().then(function (text) {
+          return { status: res.status, text: text };
+        });
+      })
+      .then(function (result) {
+        var j;
+        try {
+          j = JSON.parse(result.text);
+        } catch (_e) {
+          j = { ok: false, error: result.text };
+        }
+
+        if (j.ok) {
+          // Visual feedback: green background and checkmark
+          var deviceEl = document.getElementById('device-' + requestId);
+          if (deviceEl) {
+            deviceEl.style.background = '#4caf50';
+            deviceEl.style.color = '#fff';
+          }
+          buttonEl.textContent = 'Approved ✓';
+          buttonEl.disabled = true;
+        } else {
+          buttonEl.textContent = 'Failed';
+          buttonEl.disabled = false;
+          alert('Approval failed: ' + (j.error || j.output || 'Unknown error'));
+        }
+      })
+      .catch(function (e) {
+        buttonEl.textContent = 'Error';
+        buttonEl.disabled = false;
+        alert('Error: ' + String(e));
+      });
+  }
+
+  if (devicesRefreshBtn) {
+    devicesRefreshBtn.onclick = refreshDevices;
+  }
+
   refreshStatus();
 })();

@@ -1299,6 +1299,192 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
   });
 });
 
+// ========== CONFIG EDITOR ENDPOINTS ==========
+
+// GET /setup/api/config/raw - Load raw config file
+app.get("/setup/api/config/raw", requireSetupAuth, async (_req, res) => {
+  try {
+    const cfgPath = configPath();
+    const exists = fs.existsSync(cfgPath);
+    let content = "";
+    
+    if (exists) {
+      try {
+        content = fs.readFileSync(cfgPath, "utf8");
+      } catch (err) {
+        return res.status(500).json({
+          ok: false,
+          error: `Failed to read config file: ${String(err)}`,
+        });
+      }
+    }
+    
+    return res.json({
+      ok: true,
+      path: cfgPath,
+      exists,
+      content,
+    });
+  } catch (err) {
+    console.error("[/setup/api/config/raw GET] error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: `Internal error: ${String(err)}`,
+    });
+  }
+});
+
+// POST /setup/api/config/raw - Save raw config file with backup and restart
+app.post("/setup/api/config/raw", requireSetupAuth, async (req, res) => {
+  try {
+    const { content } = req.body || {};
+    
+    if (typeof content !== "string") {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing or invalid 'content' field (must be string)",
+      });
+    }
+    
+    // Size limit: 500KB to prevent DoS
+    const MAX_SIZE = 500 * 1024;
+    if (content.length > MAX_SIZE) {
+      return res.status(400).json({
+        ok: false,
+        error: `Config file too large (${content.length} bytes, max ${MAX_SIZE} bytes)`,
+      });
+    }
+    
+    // Validate JSON syntax
+    try {
+      JSON.parse(content);
+    } catch (err) {
+      return res.status(400).json({
+        ok: false,
+        error: `Invalid JSON: ${String(err)}`,
+      });
+    }
+    
+    const cfgPath = configPath();
+    
+    // Create timestamped backup if file exists
+    if (fs.existsSync(cfgPath)) {
+      const timestamp = new Date().toISOString().replace(/:/g, "-").replace(/\./g, "-");
+      const backupPath = `${cfgPath}.bak-${timestamp}`;
+      
+      try {
+        // Use copyFileSync for atomic backup
+        fs.copyFileSync(cfgPath, backupPath);
+        console.log(`[config-editor] Created backup: ${backupPath}`);
+      } catch (err) {
+        return res.status(500).json({
+          ok: false,
+          error: `Failed to create backup: ${String(err)}`,
+        });
+      }
+    }
+    
+    // Write new config with secure permissions
+    try {
+      fs.writeFileSync(cfgPath, content, { encoding: "utf8", mode: 0o600 });
+      console.log(`[config-editor] Saved config to ${cfgPath}`);
+    } catch (err) {
+      return res.status(500).json({
+        ok: false,
+        error: `Failed to write config file: ${String(err)}`,
+      });
+    }
+    
+    // Restart gateway to apply changes
+    let restartOutput = "";
+    try {
+      await restartGateway();
+      restartOutput = "Gateway restarted successfully to apply changes.";
+      console.log("[config-editor] Gateway restarted after config save");
+    } catch (err) {
+      restartOutput = `Warning: Config saved but gateway restart failed: ${String(err)}`;
+      console.error("[config-editor] Gateway restart failed:", err);
+    }
+    
+    return res.json({
+      ok: true,
+      message: "Config saved successfully",
+      restartOutput,
+    });
+  } catch (err) {
+    console.error("[/setup/api/config/raw POST] error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: `Internal error: ${String(err)}`,
+    });
+  }
+});
+
+// ========== DEVICE PAIRING HELPER ENDPOINTS ==========
+
+// GET /setup/api/devices/pending - List pending device requests
+app.get("/setup/api/devices/pending", requireSetupAuth, async (_req, res) => {
+  try {
+    // Run openclaw devices list command
+    const result = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "list"]));
+    
+    // Extract requestIds from output
+    const requestIds = extractDeviceRequestIds(result.output || "");
+    
+    return res.json({
+      ok: result.code === 0,
+      requestIds,
+      output: result.output || "",
+      exitCode: result.code,
+    });
+  } catch (err) {
+    console.error("[/setup/api/devices/pending] error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: `Internal error: ${String(err)}`,
+    });
+  }
+});
+
+// POST /setup/api/devices/approve - Approve a device request
+app.post("/setup/api/devices/approve", requireSetupAuth, async (req, res) => {
+  try {
+    const { requestId } = req.body || {};
+    
+    if (!requestId) {
+      return res.status(400).json({
+        ok: false,
+        error: "Missing 'requestId' field",
+      });
+    }
+    
+    // Validate requestId format (alphanumeric + underscore + dash only)
+    if (!/^[A-Za-z0-9_-]+$/.test(requestId)) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid requestId format (alphanumeric, underscore, dash only)",
+      });
+    }
+    
+    // Run openclaw devices approve command
+    const result = await runCmd(OPENCLAW_NODE, clawArgs(["devices", "approve", requestId]));
+    
+    return res.json({
+      ok: result.code === 0,
+      output: result.output || "",
+      exitCode: result.code,
+    });
+  } catch (err) {
+    console.error("[/setup/api/devices/approve] error:", err);
+    return res.status(500).json({
+      ok: false,
+      error: `Internal error: ${String(err)}`,
+    });
+  }
+});
+
+// DEPRECATED: Legacy pairing endpoint (kept for backward compatibility)
+// Use /setup/api/devices/approve instead for device pairing
 app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
   const { channel, code } = req.body || {};
   if (!channel || !code) {
