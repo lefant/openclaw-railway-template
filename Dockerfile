@@ -20,12 +20,20 @@ RUN corepack enable
 
 WORKDIR /openclaw
 
-# Use latest stable OpenClaw release (pinned to avoid main branch breakage)
-# TODO: Consider implementing auto-detection once Railway build debugging is easier
-# Can be overridden by passing --build-arg OPENCLAW_GIT_REF=<tag>
-ARG OPENCLAW_GIT_REF=v2026.2.15
-RUN echo "✓ Using OpenClaw ${OPENCLAW_GIT_REF}" && \
-  git clone --depth 1 --branch "${OPENCLAW_GIT_REF}" https://github.com/openclaw/openclaw.git .
+# OpenClaw version control:
+# - Set OPENCLAW_VERSION Railway variable to use a specific tag (e.g., v2026.2.15)
+# - If not set, defaults to main branch (original behavior)
+# - Can also override locally with --build-arg OPENCLAW_VERSION=<tag>
+ARG OPENCLAW_VERSION
+RUN set -eu; \
+  if [ -n "${OPENCLAW_VERSION:-}" ]; then \
+    REF="${OPENCLAW_VERSION}"; \
+    echo "✓ Using OpenClaw ${REF}"; \
+  else \
+    REF="main"; \
+    echo "⚠ OPENCLAW_VERSION not set, using main branch (may be unstable)"; \
+  fi; \
+  git clone --depth 1 --branch "${REF}" https://github.com/openclaw/openclaw.git .
 
 # Patch: relax version requirements for packages that may reference unpublished versions.
 # Apply to all extension package.json files to handle workspace protocol (workspace:*).
