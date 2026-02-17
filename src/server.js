@@ -482,7 +482,7 @@ function decodeJwtPayload(jwt) {
  */
 async function writeDeviceAuthCredentials(tokens, email) {
   const provider = "openai-codex";
-  const profileId = `${provider}:${email}`;
+  const profileId = "openai-codex:default";
 
   // Ensure directories exist
   fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
@@ -492,21 +492,21 @@ async function writeDeviceAuthCredentials(tokens, email) {
   if (!isConfigured()) {
     console.log(`[device-auth] Running onboard to create base config...`);
     await runCmd(OPENCLAW_NODE, clawArgs([
-      "onboard", "--non-interactive", "--accept-risk", "--json",
-      "--no-install-daemon", "--skip-health",
-      "--workspace", WORKSPACE_DIR,
-      "--gateway-bind", "loopback",
-      "--gateway-port", String(INTERNAL_GATEWAY_PORT),
-      "--gateway-auth", "token",
-      "--gateway-token", OPENCLAW_GATEWAY_TOKEN,
-      "--flow", "quickstart",
+      "onboard",
       "--auth-choice", provider,
+      "--accept-risk",
+      "--flow", "quickstart",
+      "--skip-channels",
+      "--skip-skills",
+      "--skip-health",
+      "--skip-daemon",
+      "--skip-ui",
     ]));
   }
 
   // Write OAuth credentials to auth-profiles.json (openclaw's credential store)
   const authStorePath = path.join(STATE_DIR, "auth-profiles.json");
-  let store = { version: 1, profiles: {}, order: [], lastGood: null };
+  let store = { version: 1, profiles: {}, order: {}, lastGood: {} };
   try {
     if (fs.existsSync(authStorePath)) {
       store = JSON.parse(fs.readFileSync(authStorePath, "utf8"));
@@ -530,57 +530,53 @@ async function writeDeviceAuthCredentials(tokens, email) {
     email,
   };
 
-  // Update order and lastGood
-  if (!store.order) store.order = [];
-  if (!store.order.includes(profileId)) {
-    store.order.unshift(profileId);
+  // Update order and lastGood (keyed by provider)
+  if (!store.order || Array.isArray(store.order)) store.order = {};
+  if (!store.order[provider]) store.order[provider] = [];
+  if (!store.order[provider].includes(profileId)) {
+    store.order[provider].unshift(profileId);
   }
-  store.lastGood = profileId;
+  if (!store.lastGood || typeof store.lastGood === "string") store.lastGood = {};
+  store.lastGood[provider] = profileId;
 
-  // Write atomically
-  fs.writeFileSync(authStorePath, JSON.stringify(store, null, 2), {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  console.log(`[device-auth] Wrote credentials to auth-profiles.json for ${profileId}`);
+  // Write to both the root state dir and the main agent dir
+  const storeJson = JSON.stringify(store, null, 2);
+  const storePaths = [
+    authStorePath,
+    path.join(STATE_DIR, "agents", "main", "agent", "auth-profiles.json"),
+  ];
 
-  // Update openclaw.json with auth profile reference
-  const cfgPath = configPath();
-  try {
-    let cfg = {};
-    if (fs.existsSync(cfgPath)) {
-      cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
-    }
-
-    cfg.auth = cfg.auth || {};
-    cfg.auth.profiles = cfg.auth.profiles || {};
-    cfg.auth.profiles[profileId] = {
-      provider,
-      mode: "oauth",
-    };
-    cfg.auth.default = profileId;
-
-    fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), {
-      encoding: "utf8",
-      mode: 0o600,
-    });
-    console.log(`[device-auth] Updated openclaw.json with auth profile: ${profileId}`);
-  } catch (err) {
-    console.error(`[device-auth] Failed to update config: ${err.message}`);
-    throw err;
+  for (const p of storePaths) {
+    fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(p, storeJson, { encoding: "utf8", mode: 0o600 });
+    console.log(`[device-auth] Wrote credentials to ${p}`);
   }
 
-  // Set the default model for openai-codex
-  try {
-    await runCmd(OPENCLAW_NODE, clawArgs([
-      "models", "set", "openai-codex/gpt-4.1",
-    ]));
-  } catch (err) {
-    console.warn(`[device-auth] Could not set default model: ${err.message}`);
-  }
+  // Register the auth profile in openclaw.json (provider + mode only)
+  await runCmd(OPENCLAW_NODE, clawArgs([
+    "config", "set", "--json",
+    `auth.profiles.${profileId}`,
+    JSON.stringify({ provider, mode: "oauth" }),
+  ]));
 
-  // Sync gateway token and restart
-  await restartGateway();
+  // Apply the same post-onboard gateway config that /setup/api/run does
+  console.log(`[device-auth] Configuring gateway...`);
+  await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.mode", "local"]));
+  await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
+  await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
+  await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.bind", "loopback"]));
+  await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.port", String(INTERNAL_GATEWAY_PORT)]));
+  await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.controlUi.allowInsecureAuth", "true"]));
+  await runCmd(OPENCLAW_NODE, clawArgs([
+    "config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"]),
+  ]));
+
+  // Run doctor --fix to clean up any config issues
+  await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
+
+  // Start the gateway (startGateway() no-ops if already running)
+  console.log(`[device-auth] Starting gateway...`);
+  await startGateway();
 }
 
 function sleep(ms) {
