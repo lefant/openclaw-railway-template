@@ -321,6 +321,268 @@ let lastGatewayExit = null;
 let lastDoctorOutput = null;
 let lastDoctorAt = null;
 
+// ========== DEVICE AUTH FLOW STATE ==========
+// OpenAI's device code auth constants
+const OPENAI_AUTH_ISSUER = "https://auth.openai.com";
+const OPENAI_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+
+// In-flight device auth sessions, keyed by random UUID.
+const deviceAuthSessions = new Map();
+
+// Session structure:
+// {
+//   id: string,
+//   status: 'requesting' | 'polling' | 'exchanging' | 'done' | 'error',
+//   verificationUrl: string | null,
+//   userCode: string | null,
+//   deviceAuthId: string | null,   // internal, not exposed
+//   pollInterval: number,          // seconds
+//   error: string | null,
+//   result: { profileId: string, email?: string } | null,
+//   createdAt: number,
+//   abortController: AbortController | null,
+// }
+
+// Cleanup stale sessions every 5 minutes
+setInterval(() => {
+  const now = Date.now();
+  const maxAge = 20 * 60 * 1000; // 20 minutes (15 min timeout + buffer)
+  for (const [id, session] of deviceAuthSessions) {
+    if (now - session.createdAt > maxAge) {
+      if (session.abortController) {
+        session.abortController.abort();
+      }
+      deviceAuthSessions.delete(id);
+    }
+  }
+}, 5 * 60 * 1000);
+
+// ========== OPENAI DEVICE AUTH CLIENT ==========
+
+/**
+ * Request a device code from OpenAI.
+ * Returns { deviceAuthId, userCode, interval, verificationUrl }
+ */
+async function requestDeviceUserCode() {
+  const url = `${OPENAI_AUTH_ISSUER}/api/accounts/deviceauth/usercode`;
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ client_id: OPENAI_CLIENT_ID }),
+  });
+
+  if (!resp.ok) {
+    if (resp.status === 404) {
+      throw new Error("Device code login is not enabled. Use API key authentication instead.");
+    }
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Failed to request device code: ${resp.status} ${text}`);
+  }
+
+  const data = await resp.json();
+
+  // Normalize field names (API may return user_code or usercode)
+  const userCode = data.user_code || data.usercode;
+  const interval = parseInt(data.interval, 10) || 5;
+
+  return {
+    deviceAuthId: data.device_auth_id,
+    userCode,
+    interval,
+    verificationUrl: `${OPENAI_AUTH_ISSUER}/codex/device`,
+  };
+}
+
+/**
+ * Poll the device auth token endpoint.
+ * Returns null if still pending, or { authorizationCode, codeVerifier, codeChallenge } on success.
+ */
+async function pollDeviceAuthToken(deviceAuthId, userCode, signal) {
+  const url = `${OPENAI_AUTH_ISSUER}/api/accounts/deviceauth/token`;
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      device_auth_id: deviceAuthId,
+      user_code: userCode,
+    }),
+    signal,
+  });
+
+  // 403 or 404 = still pending
+  if (resp.status === 403 || resp.status === 404) {
+    return null;
+  }
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Device auth poll failed: ${resp.status} ${text}`);
+  }
+
+  const data = await resp.json();
+  return {
+    authorizationCode: data.authorization_code,
+    codeVerifier: data.code_verifier,
+    codeChallenge: data.code_challenge,
+  };
+}
+
+/**
+ * Exchange authorization code for tokens.
+ * Returns { idToken, accessToken, refreshToken }
+ */
+async function exchangeDeviceAuthCode(authorizationCode, codeVerifier) {
+  const url = `${OPENAI_AUTH_ISSUER}/oauth/token`;
+
+  const params = new URLSearchParams({
+    grant_type: "authorization_code",
+    code: authorizationCode,
+    redirect_uri: `${OPENAI_AUTH_ISSUER}/deviceauth/callback`,
+    client_id: OPENAI_CLIENT_ID,
+    code_verifier: codeVerifier,
+  });
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`Token exchange failed: ${resp.status} ${text}`);
+  }
+
+  const data = await resp.json();
+  return {
+    idToken: data.id_token,
+    accessToken: data.access_token,
+    refreshToken: data.refresh_token,
+  };
+}
+
+/**
+ * Decode JWT payload to extract email/account info (no signature verification needed).
+ */
+function decodeJwtPayload(jwt) {
+  try {
+    const parts = jwt.split(".");
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write device auth credentials to openclaw config and start gateway.
+ */
+async function writeDeviceAuthCredentials(tokens, email) {
+  const provider = "openai-codex";
+  const profileId = `${provider}:${email}`;
+
+  // Ensure directories exist
+  fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(WORKSPACE_DIR, { recursive: true });
+
+  // If config doesn't exist yet, run minimal onboard to create it
+  if (!isConfigured()) {
+    console.log(`[device-auth] Running onboard to create base config...`);
+    await runCmd(OPENCLAW_NODE, clawArgs([
+      "onboard", "--non-interactive", "--accept-risk", "--json",
+      "--no-install-daemon", "--skip-health",
+      "--workspace", WORKSPACE_DIR,
+      "--gateway-bind", "loopback",
+      "--gateway-port", String(INTERNAL_GATEWAY_PORT),
+      "--gateway-auth", "token",
+      "--gateway-token", OPENCLAW_GATEWAY_TOKEN,
+      "--flow", "quickstart",
+      "--auth-choice", provider,
+    ]));
+  }
+
+  // Write OAuth credentials to auth-profiles.json (openclaw's credential store)
+  const authStorePath = path.join(STATE_DIR, "auth-profiles.json");
+  let store = { version: 1, profiles: {}, order: [], lastGood: null };
+  try {
+    if (fs.existsSync(authStorePath)) {
+      store = JSON.parse(fs.readFileSync(authStorePath, "utf8"));
+    }
+  } catch (err) {
+    console.warn(`[device-auth] Could not read existing auth-profiles.json: ${err.message}`);
+  }
+
+  // Calculate token expiry (id_token typically has exp claim)
+  const payload = decodeJwtPayload(tokens.idToken);
+  const expiresAt = payload?.exp ? payload.exp * 1000 : Date.now() + 3600 * 1000;
+
+  // Upsert the profile
+  store.profiles = store.profiles || {};
+  store.profiles[profileId] = {
+    type: "oauth",
+    provider,
+    access: tokens.accessToken,
+    refresh: tokens.refreshToken,
+    expires: expiresAt,
+    email,
+  };
+
+  // Update order and lastGood
+  if (!store.order) store.order = [];
+  if (!store.order.includes(profileId)) {
+    store.order.unshift(profileId);
+  }
+  store.lastGood = profileId;
+
+  // Write atomically
+  fs.writeFileSync(authStorePath, JSON.stringify(store, null, 2), {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+  console.log(`[device-auth] Wrote credentials to auth-profiles.json for ${profileId}`);
+
+  // Update openclaw.json with auth profile reference
+  const cfgPath = configPath();
+  try {
+    let cfg = {};
+    if (fs.existsSync(cfgPath)) {
+      cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+    }
+
+    cfg.auth = cfg.auth || {};
+    cfg.auth.profiles = cfg.auth.profiles || {};
+    cfg.auth.profiles[profileId] = {
+      provider,
+      mode: "oauth",
+    };
+    cfg.auth.default = profileId;
+
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    console.log(`[device-auth] Updated openclaw.json with auth profile: ${profileId}`);
+  } catch (err) {
+    console.error(`[device-auth] Failed to update config: ${err.message}`);
+    throw err;
+  }
+
+  // Set the default model for openai-codex
+  try {
+    await runCmd(OPENCLAW_NODE, clawArgs([
+      "models", "set", "openai-codex/gpt-4.1",
+    ]));
+  } catch (err) {
+    console.warn(`[device-auth] Could not set default model: ${err.message}`);
+  }
+
+  // Sync gateway token and restart
+  await restartGateway();
+}
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
@@ -1958,6 +2220,203 @@ app.get("/setup/api/auth-groups", requireSetupAuth, async (_req, res) => {
       error: `Internal error: ${String(err)}`,
     });
   }
+});
+
+// ========== DEVICE AUTH START ENDPOINT ==========
+
+/**
+ * POST /setup/api/device-auth/start - Initiate device code auth flow
+ * Returns { sessionId, verificationUrl, userCode }
+ */
+app.post("/setup/api/device-auth/start", requireSetupAuth, async (req, res) => {
+  const sessionId = crypto.randomUUID();
+  const abortController = new AbortController();
+
+  const session = {
+    id: sessionId,
+    status: "requesting",
+    verificationUrl: null,
+    userCode: null,
+    deviceAuthId: null,
+    pollInterval: 5,
+    error: null,
+    result: null,
+    createdAt: Date.now(),
+    abortController,
+  };
+  deviceAuthSessions.set(sessionId, session);
+
+  try {
+    // Step 1: Request user code
+    const codeResp = await requestDeviceUserCode();
+
+    session.verificationUrl = codeResp.verificationUrl;
+    session.userCode = codeResp.userCode;
+    session.deviceAuthId = codeResp.deviceAuthId;
+    session.pollInterval = codeResp.interval;
+    session.status = "polling";
+
+    console.log(`[device-auth] Session ${sessionId}: Got code ${codeResp.userCode}, starting poll`);
+
+    // Start background polling loop
+    runDeviceAuthPollingLoop(session);
+
+    return res.json({
+      ok: true,
+      sessionId,
+      verificationUrl: codeResp.verificationUrl,
+      userCode: codeResp.userCode,
+      message: `Open ${codeResp.verificationUrl} and enter code: ${codeResp.userCode}`,
+    });
+
+  } catch (err) {
+    session.status = "error";
+    session.error = String(err.message || err);
+    console.error(`[device-auth] Session ${sessionId}: Start failed:`, err);
+
+    return res.status(500).json({
+      ok: false,
+      error: session.error,
+    });
+  }
+});
+
+/**
+ * Background polling loop for device auth.
+ * Runs until authorization, timeout, or abort.
+ */
+async function runDeviceAuthPollingLoop(session) {
+  const maxWaitMs = 15 * 60 * 1000; // 15 minutes
+  const startTime = Date.now();
+
+  while (session.status === "polling") {
+    // Check timeout
+    if (Date.now() - startTime > maxWaitMs) {
+      session.status = "error";
+      session.error = "Device auth timed out after 15 minutes";
+      console.log(`[device-auth] Session ${session.id}: Timeout`);
+      return;
+    }
+
+    try {
+      const pollResult = await pollDeviceAuthToken(
+        session.deviceAuthId,
+        session.userCode,
+        session.abortController.signal
+      );
+
+      if (pollResult === null) {
+        // Still pending, wait and retry
+        await sleep(session.pollInterval * 1000);
+        continue;
+      }
+
+      // User authorized! Exchange for tokens
+      session.status = "exchanging";
+      console.log(`[device-auth] Session ${session.id}: User authorized, exchanging code`);
+
+      const tokens = await exchangeDeviceAuthCode(
+        pollResult.authorizationCode,
+        pollResult.codeVerifier
+      );
+
+      // Extract email from id_token
+      const payload = decodeJwtPayload(tokens.idToken);
+      const email = payload?.email ||
+                    payload?.["https://api.openai.com/profile"]?.email ||
+                    "default";
+
+      // Write credentials to openclaw config
+      await writeDeviceAuthCredentials(tokens, email);
+
+      session.status = "done";
+      session.result = {
+        profileId: `openai-codex:${email}`,
+        email,
+      };
+      console.log(`[device-auth] Session ${session.id}: Complete! Email: ${email}`);
+
+    } catch (err) {
+      if (err.name === "AbortError") {
+        session.status = "error";
+        session.error = "Session cancelled";
+        return;
+      }
+      session.status = "error";
+      session.error = String(err.message || err);
+      console.error(`[device-auth] Session ${session.id}: Error:`, err);
+      return;
+    }
+  }
+}
+
+// ========== DEVICE AUTH STATUS ENDPOINT ==========
+
+/**
+ * GET /setup/api/device-auth/status - Poll for device auth completion
+ */
+app.get("/setup/api/device-auth/status", requireSetupAuth, async (req, res) => {
+  const sessionId = req.query.session;
+
+  if (!sessionId) {
+    return res.status(400).json({
+      ok: false,
+      error: "Missing session query parameter",
+    });
+  }
+
+  const session = deviceAuthSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({
+      ok: false,
+      error: "Unknown or expired session. Sessions expire after 20 minutes.",
+    });
+  }
+
+  return res.json({
+    ok: true,
+    sessionId: session.id,
+    status: session.status,
+    verificationUrl: session.verificationUrl,
+    userCode: session.userCode,
+    error: session.error,
+    result: session.result,
+  });
+});
+
+/**
+ * POST /setup/api/device-auth/cancel - Cancel an in-progress device auth
+ */
+app.post("/setup/api/device-auth/cancel", requireSetupAuth, async (req, res) => {
+  const { sessionId } = req.body || {};
+
+  if (!sessionId) {
+    return res.status(400).json({
+      ok: false,
+      error: "Missing sessionId",
+    });
+  }
+
+  const session = deviceAuthSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({
+      ok: false,
+      error: "Unknown or expired session",
+    });
+  }
+
+  if (session.abortController) {
+    session.abortController.abort();
+  }
+  session.status = "error";
+  session.error = "Cancelled by user";
+
+  console.log(`[device-auth] Session ${sessionId}: Cancelled`);
+
+  return res.json({
+    ok: true,
+    message: "Session cancelled",
+  });
 });
 
 app.get("/setup/export", requireSetupAuth, async (_req, res) => {

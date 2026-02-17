@@ -124,6 +124,54 @@
     </select>
   </div>
 
+  <div class="card" id="deviceAuthCard" style="display: none;">
+    <h2>Sign in with ChatGPT</h2>
+
+    <div id="deviceAuthStep1">
+      <p>You selected <strong id="deviceAuthProviderName">OpenAI Codex</strong> which uses ChatGPT OAuth.</p>
+      <p class="muted">Click below to get a one-time code, then enter it at OpenAI's sign-in page.</p>
+      <button id="deviceAuthStartBtn">Get Sign-in Code</button>
+    </div>
+
+    <div id="deviceAuthStep2" style="display: none;">
+      <div class="device-code-display">
+        <p><strong>Step 1:</strong> Open this link in any browser:</p>
+        <div class="url-box">
+          <a id="deviceAuthUrl" href="#" target="_blank" rel="noopener">https://auth.openai.com/codex/device</a>
+          <button id="copyUrlBtn" class="small-btn" title="Copy URL">Copy</button>
+        </div>
+
+        <p style="margin-top: 1.5rem;"><strong>Step 2:</strong> Enter this code:</p>
+        <div class="code-box" id="deviceAuthCode">----</div>
+        <button id="copyCodeBtn" class="small-btn" title="Copy code">Copy Code</button>
+
+        <p class="muted" style="margin-top: 1rem;">
+          This code expires in 15 minutes. After entering it, return here.
+        </p>
+      </div>
+
+      <div id="deviceAuthWaiting" style="margin-top: 1.5rem;">
+        <div class="spinner-inline"></div>
+        <span>Waiting for authorization...</span>
+      </div>
+
+      <button id="deviceAuthCancelBtn" class="tertiary-button" style="margin-top: 1rem;">Cancel</button>
+    </div>
+
+    <div id="deviceAuthStep3" style="display: none;">
+      <div id="deviceAuthSuccess" style="display: none;">
+        <p>&#10003; Signed in successfully!</p>
+        <p class="muted">Email: <span id="deviceAuthEmail">-</span></p>
+        <p>Gateway is starting...</p>
+      </div>
+      <div id="deviceAuthError" style="display: none;">
+        <p style="color: #ff4d4d;">&#10007; Authentication failed</p>
+        <p class="muted" id="deviceAuthErrorMsg">-</p>
+        <button id="deviceAuthRetryBtn">Try Again</button>
+      </div>
+    </div>
+  </div>
+
   <div class="card">
     <h2>2) Optional: Channels</h2>
     <p class="muted">You can also add channels later inside Openclaw, but this helps you get messaging working immediately.</p>

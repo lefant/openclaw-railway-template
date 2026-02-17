@@ -621,9 +621,233 @@
     importButtonEl.onclick = importBackup;
   }
 
+  // ========== DEVICE AUTH FLOW ==========
+  var deviceAuthCardEl = document.getElementById('deviceAuthCard');
+  var deviceAuthStep1El = document.getElementById('deviceAuthStep1');
+  var deviceAuthStep2El = document.getElementById('deviceAuthStep2');
+  var deviceAuthStep3El = document.getElementById('deviceAuthStep3');
+  var deviceAuthProviderNameEl = document.getElementById('deviceAuthProviderName');
+  var deviceAuthStartBtnEl = document.getElementById('deviceAuthStartBtn');
+  var deviceAuthUrlEl = document.getElementById('deviceAuthUrl');
+  var deviceAuthCodeEl = document.getElementById('deviceAuthCode');
+  var copyUrlBtnEl = document.getElementById('copyUrlBtn');
+  var copyCodeBtnEl = document.getElementById('copyCodeBtn');
+  var deviceAuthCancelBtnEl = document.getElementById('deviceAuthCancelBtn');
+  var deviceAuthSuccessEl = document.getElementById('deviceAuthSuccess');
+  var deviceAuthErrorEl = document.getElementById('deviceAuthError');
+  var deviceAuthEmailEl = document.getElementById('deviceAuthEmail');
+  var deviceAuthErrorMsgEl = document.getElementById('deviceAuthErrorMsg');
+  var deviceAuthRetryBtnEl = document.getElementById('deviceAuthRetryBtn');
+
+  var currentDeviceAuthSession = null;
+  var deviceAuthPollInterval = null;
+
+  // Auth choices that support device code flow
+  var DEVICE_AUTH_PROVIDERS = ['openai-codex', 'codex-cli'];
+
+  function isDeviceAuthProvider(authChoice) {
+    return DEVICE_AUTH_PROVIDERS.indexOf(authChoice) >= 0;
+  }
+
+  function showDeviceAuthCard(providerLabel) {
+    if (deviceAuthCardEl) {
+      deviceAuthCardEl.style.display = 'block';
+      deviceAuthProviderNameEl.textContent = providerLabel || 'OpenAI Codex';
+      deviceAuthStep1El.style.display = 'block';
+      deviceAuthStep2El.style.display = 'none';
+      deviceAuthStep3El.style.display = 'none';
+      deviceAuthSuccessEl.style.display = 'none';
+      deviceAuthErrorEl.style.display = 'none';
+    }
+  }
+
+  function hideDeviceAuthCard() {
+    if (deviceAuthCardEl) {
+      deviceAuthCardEl.style.display = 'none';
+    }
+    stopDeviceAuthPolling();
+    currentDeviceAuthSession = null;
+  }
+
+  function stopDeviceAuthPolling() {
+    if (deviceAuthPollInterval) {
+      clearInterval(deviceAuthPollInterval);
+      deviceAuthPollInterval = null;
+    }
+  }
+
+  // Show/hide device auth card when auth choice changes
+  if (authChoiceEl) {
+    var originalAuthChoiceHandler = authChoiceEl.onchange;
+    authChoiceEl.onchange = function () {
+      // Call existing handler first (handles __show_all__)
+      if (originalAuthChoiceHandler) {
+        originalAuthChoiceHandler.call(this);
+      }
+
+      var selectedChoice = authChoiceEl.value;
+      if (isDeviceAuthProvider(selectedChoice)) {
+        var label = selectedChoice;
+        for (var i = 0; i < authChoiceEl.options.length; i++) {
+          if (authChoiceEl.options[i].value === selectedChoice) {
+            label = authChoiceEl.options[i].textContent;
+            break;
+          }
+        }
+        showDeviceAuthCard(label);
+      } else {
+        hideDeviceAuthCard();
+      }
+    };
+  }
+
+  // Start device auth flow
+  if (deviceAuthStartBtnEl) {
+    deviceAuthStartBtnEl.onclick = async function () {
+      deviceAuthStartBtnEl.disabled = true;
+      deviceAuthStartBtnEl.textContent = 'Starting...';
+
+      try {
+        var resp = await httpJson('/setup/api/device-auth/start', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({}),
+        });
+
+        if (!resp.ok) {
+          throw new Error(resp.error || 'Failed to start device auth');
+        }
+
+        currentDeviceAuthSession = resp.sessionId;
+        deviceAuthUrlEl.href = resp.verificationUrl;
+        deviceAuthUrlEl.textContent = resp.verificationUrl;
+        deviceAuthCodeEl.textContent = resp.userCode;
+
+        // Show step 2
+        deviceAuthStep1El.style.display = 'none';
+        deviceAuthStep2El.style.display = 'block';
+
+        // Start polling
+        startDeviceAuthPolling();
+
+      } catch (e) {
+        showDeviceAuthError(String(e));
+      } finally {
+        deviceAuthStartBtnEl.disabled = false;
+        deviceAuthStartBtnEl.textContent = 'Get Sign-in Code';
+      }
+    };
+  }
+
+  // Copy buttons
+  if (copyUrlBtnEl) {
+    copyUrlBtnEl.onclick = function () {
+      navigator.clipboard.writeText(deviceAuthUrlEl.href);
+      copyUrlBtnEl.textContent = 'Copied!';
+      setTimeout(function () { copyUrlBtnEl.textContent = 'Copy'; }, 1500);
+    };
+  }
+  if (copyCodeBtnEl) {
+    copyCodeBtnEl.onclick = function () {
+      navigator.clipboard.writeText(deviceAuthCodeEl.textContent);
+      copyCodeBtnEl.textContent = 'Copied!';
+      setTimeout(function () { copyCodeBtnEl.textContent = 'Copy Code'; }, 1500);
+    };
+  }
+
+  // Cancel
+  if (deviceAuthCancelBtnEl) {
+    deviceAuthCancelBtnEl.onclick = async function () {
+      stopDeviceAuthPolling();
+      if (currentDeviceAuthSession) {
+        try {
+          await httpJson('/setup/api/device-auth/cancel', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId: currentDeviceAuthSession }),
+          });
+        } catch (e) {
+          console.warn('Cancel failed:', e);
+        }
+      }
+      hideDeviceAuthCard();
+      // Re-show step 1
+      showDeviceAuthCard();
+    };
+  }
+
+  // Retry
+  if (deviceAuthRetryBtnEl) {
+    deviceAuthRetryBtnEl.onclick = function () {
+      deviceAuthStep1El.style.display = 'block';
+      deviceAuthStep2El.style.display = 'none';
+      deviceAuthStep3El.style.display = 'none';
+      currentDeviceAuthSession = null;
+    };
+  }
+
+  function showDeviceAuthError(msg) {
+    deviceAuthStep1El.style.display = 'none';
+    deviceAuthStep2El.style.display = 'none';
+    deviceAuthStep3El.style.display = 'block';
+    deviceAuthSuccessEl.style.display = 'none';
+    deviceAuthErrorEl.style.display = 'block';
+    deviceAuthErrorMsgEl.textContent = msg;
+  }
+
+  function startDeviceAuthPolling() {
+    stopDeviceAuthPolling();
+
+    var pollCount = 0;
+    var maxPolls = 200; // ~5 minutes at 1.5s interval (backup timeout)
+
+    deviceAuthPollInterval = setInterval(async function () {
+      pollCount++;
+      if (pollCount > maxPolls) {
+        stopDeviceAuthPolling();
+        showDeviceAuthError('Polling timeout. Please try again.');
+        return;
+      }
+
+      if (!currentDeviceAuthSession) {
+        stopDeviceAuthPolling();
+        return;
+      }
+
+      try {
+        var resp = await httpJson(
+          '/setup/api/device-auth/status?session=' + currentDeviceAuthSession
+        );
+
+        if (resp.status === 'done') {
+          stopDeviceAuthPolling();
+          deviceAuthStep2El.style.display = 'none';
+          deviceAuthStep3El.style.display = 'block';
+          deviceAuthSuccessEl.style.display = 'block';
+          deviceAuthEmailEl.textContent = resp.result?.email || 'Unknown';
+
+          // Refresh main status after a moment
+          setTimeout(function () {
+            refreshStatus();
+            hideDeviceAuthCard();
+          }, 2000);
+
+        } else if (resp.status === 'error') {
+          stopDeviceAuthPolling();
+          showDeviceAuthError(resp.error || 'Authentication failed');
+        }
+        // else: still polling, continue
+
+      } catch (e) {
+        console.warn('Poll error:', e);
+        // Don't stop polling on transient errors
+      }
+    }, 1500);
+  }
+
   // Load auth groups immediately (fast endpoint)
   loadAuthGroups();
-  
+
   // Load status (slower, but needed for version info)
   refreshStatus();
 })();

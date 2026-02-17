@@ -109,3 +109,79 @@ a:hover {
 h1, h2, h3 {
   color: #f0f4ff;
 }
+
+/* Device auth flow styles */
+#deviceAuthCard .device-code-display {
+  background: #1f2937;
+  padding: 1.5rem;
+  border-radius: 8px;
+  margin-top: 1rem;
+}
+
+#deviceAuthCard .url-box {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+#deviceAuthCard .url-box a {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 14px;
+  word-break: break-all;
+}
+
+#deviceAuthCard .code-box {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 2rem;
+  font-weight: bold;
+  letter-spacing: 0.2em;
+  padding: 0.75rem 1rem;
+  background: #0d1117;
+  border: 2px solid #374151;
+  border-radius: 6px;
+  display: inline-block;
+  margin-top: 0.5rem;
+  user-select: all;
+  color: #00e5cc;
+}
+
+#deviceAuthCard .small-btn {
+  padding: 0.25rem 0.5rem;
+  font-size: 12px;
+}
+
+#deviceAuthCard .spinner-inline {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid #374151;
+  border-top-color: #ff4d4d;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+  margin-right: 0.5rem;
+  vertical-align: middle;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+#deviceAuthCard #deviceAuthWaiting {
+  color: #8892b0;
+}
+
+textarea {
+  width: 100%;
+  padding: 0.6rem;
+  margin-top: 0.25rem;
+  background: #1f2937;
+  border: 1px solid #374151;
+  border-radius: 8px;
+  color: #f0f4ff;
+}
+
+textarea:focus {
+  outline: none;
+  border-color: #ff4d4d;
+}
