@@ -571,6 +571,49 @@ async function writeDeviceAuthCredentials(tokens, email) {
     "config", "set", "--json", "gateway.trustedProxies", JSON.stringify(["127.0.0.1"]),
   ]));
 
+  // Set an openai-codex model as default (otherwise it stays on anthropic)
+  // Try to discover available model, fall back to well-known default
+  console.log(`[device-auth] Setting default model to openai-codex...`);
+  let codexModel = null;
+  try {
+    const modelsResult = await runCmd(OPENCLAW_NODE, clawArgs(["models", "list"]), { timeoutMs: 10000 });
+    const modelsOutput = modelsResult.output || "";
+    console.log(`[device-auth] models list output (${modelsOutput.length} chars): ${modelsOutput.slice(0, 500)}`);
+    const codexModelLine = modelsOutput.split("\n").find(
+      (l) => l.includes("openai-codex/") && !l.includes("(disabled)")
+    );
+    if (codexModelLine) {
+      const modelMatch = codexModelLine.match(/(openai-codex\/\S+)/);
+      if (modelMatch) codexModel = modelMatch[1];
+    }
+  } catch (err) {
+    console.warn(`[device-auth] models list failed: ${err.message}`);
+  }
+
+  if (!codexModel) {
+    // Fall back to well-known model name
+    codexModel = "openai-codex/gpt-5.2";
+    console.log(`[device-auth] No model discovered, using fallback: ${codexModel}`);
+  } else {
+    console.log(`[device-auth] Discovered model: ${codexModel}`);
+  }
+
+  // Set via both CLI and direct config (belt and suspenders)
+  try {
+    await runCmd(OPENCLAW_NODE, clawArgs(["models", "set", codexModel]));
+    console.log(`[device-auth] models set succeeded`);
+  } catch (err) {
+    console.warn(`[device-auth] models set failed: ${err.message}, setting config directly`);
+  }
+
+  // Ensure agents.defaults.model.primary is set in config (matches working config structure)
+  await runCmd(OPENCLAW_NODE, clawArgs([
+    "config", "set", "agents.defaults.model.primary", codexModel,
+  ]));
+  await runCmd(OPENCLAW_NODE, clawArgs([
+    "config", "set", "--json", `agents.defaults.models`, JSON.stringify({ [codexModel]: {} }),
+  ]));
+
   // Run doctor --fix to clean up any config issues
   await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
 
