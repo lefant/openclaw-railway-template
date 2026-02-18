@@ -357,6 +357,67 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+// ========== OAUTH REDIRECT (PASTE-BACK) STATE ==========
+const OPENAI_AUTHORIZE_URL = `${OPENAI_AUTH_ISSUER}/oauth/authorize`;
+const OPENAI_TOKEN_URL = `${OPENAI_AUTH_ISSUER}/oauth/token`;
+const OPENAI_REDIRECT_URI = "http://localhost:1455/auth/callback";
+const OPENAI_SCOPE = "openid profile email offline_access";
+
+// In-flight redirect OAuth sessions, keyed by random UUID.
+// Session shape: { id, status, authUrl, state, codeVerifier, error, result, createdAt }
+const oauthSessions = new Map();
+
+// Cleanup stale sessions every 5 minutes (10 min TTL + buffer)
+setInterval(() => {
+  const now = Date.now();
+  const maxAge = 15 * 60 * 1000;
+  for (const [id, session] of oauthSessions) {
+    if (now - session.createdAt > maxAge) {
+      oauthSessions.delete(id);
+    }
+  }
+}, 5 * 60 * 1000);
+
+function base64UrlEncode(buf) {
+  return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function createPkcePair() {
+  const verifier = base64UrlEncode(crypto.randomBytes(32));
+  const challenge = base64UrlEncode(crypto.createHash("sha256").update(verifier).digest());
+  return { verifier, challenge };
+}
+
+function parseOAuthRedirectInput(input) {
+  const value = String(input || "").trim();
+  if (!value) return {};
+
+  try {
+    const url = new URL(value);
+    return {
+      code: url.searchParams.get("code") || undefined,
+      state: url.searchParams.get("state") || undefined,
+    };
+  } catch {
+    // not a URL
+  }
+
+  if (value.includes("#")) {
+    const [code, state] = value.split("#", 2);
+    return { code: code || undefined, state: state || undefined };
+  }
+
+  if (value.includes("code=")) {
+    const params = new URLSearchParams(value);
+    return {
+      code: params.get("code") || undefined,
+      state: params.get("state") || undefined,
+    };
+  }
+
+  return { code: value };
+}
+
 // ========== OPENAI DEVICE AUTH CLIENT ==========
 
 /**
@@ -478,9 +539,10 @@ function decodeJwtPayload(jwt) {
 }
 
 /**
- * Write device auth credentials to openclaw config and start gateway.
+ * Write OpenAI Codex OAuth credentials to openclaw config and start gateway.
+ * Supports both device-code and redirect flows.
  */
-async function writeDeviceAuthCredentials(tokens, email) {
+async function writeCodexAuthCredentials(tokens, emailHint) {
   const provider = "openai-codex";
   const profileId = "openai-codex:default";
 
@@ -490,7 +552,7 @@ async function writeDeviceAuthCredentials(tokens, email) {
 
   // If config doesn't exist yet, run minimal onboard to create it
   if (!isConfigured()) {
-    console.log(`[device-auth] Running onboard to create base config...`);
+    console.log(`[codex-auth] Running onboard to create base config...`);
     await runCmd(OPENCLAW_NODE, clawArgs([
       "onboard",
       "--auth-choice", provider,
@@ -512,12 +574,22 @@ async function writeDeviceAuthCredentials(tokens, email) {
       store = JSON.parse(fs.readFileSync(authStorePath, "utf8"));
     }
   } catch (err) {
-    console.warn(`[device-auth] Could not read existing auth-profiles.json: ${err.message}`);
+    console.warn(`[codex-auth] Could not read existing auth-profiles.json: ${err.message}`);
   }
 
-  // Calculate token expiry (id_token typically has exp claim)
-  const payload = decodeJwtPayload(tokens.idToken);
-  const expiresAt = payload?.exp ? payload.exp * 1000 : Date.now() + 3600 * 1000;
+  const decoded = tokens.idToken ? decodeJwtPayload(tokens.idToken) : null;
+  const expiresAt =
+    tokens.expiresAt ??
+    (decoded?.exp ? decoded.exp * 1000 : undefined) ??
+    (typeof tokens.expiresIn === "number" ? Date.now() + tokens.expiresIn * 1000 : undefined) ??
+    Date.now() + 3600 * 1000;
+
+  const email =
+    emailHint ||
+    decoded?.email ||
+    decoded?.["https://api.openai.com/profile"]?.email ||
+    decoded?.["https://api.openai.com/auth"]?.chatgpt_account_id ||
+    "default";
 
   // Upsert the profile
   store.profiles = store.profiles || {};
@@ -549,7 +621,7 @@ async function writeDeviceAuthCredentials(tokens, email) {
   for (const p of storePaths) {
     fs.mkdirSync(path.dirname(p), { recursive: true, mode: 0o700 });
     fs.writeFileSync(p, storeJson, { encoding: "utf8", mode: 0o600 });
-    console.log(`[device-auth] Wrote credentials to ${p}`);
+    console.log(`[codex-auth] Wrote credentials to ${p}`);
   }
 
   // Register the auth profile in openclaw.json (provider + mode only)
@@ -560,7 +632,7 @@ async function writeDeviceAuthCredentials(tokens, email) {
   ]));
 
   // Apply the same post-onboard gateway config that /setup/api/run does
-  console.log(`[device-auth] Configuring gateway...`);
+  console.log(`[codex-auth] Configuring gateway...`);
   await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.mode", "local"]));
   await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.mode", "token"]));
   await runCmd(OPENCLAW_NODE, clawArgs(["config", "set", "gateway.auth.token", OPENCLAW_GATEWAY_TOKEN]));
@@ -573,12 +645,12 @@ async function writeDeviceAuthCredentials(tokens, email) {
 
   // Set an openai-codex model as default (otherwise it stays on anthropic)
   // Try to discover available model, fall back to well-known default
-  console.log(`[device-auth] Setting default model to openai-codex...`);
+  console.log(`[codex-auth] Setting default model to openai-codex...`);
   let codexModel = null;
   try {
     const modelsResult = await runCmd(OPENCLAW_NODE, clawArgs(["models", "list"]), { timeoutMs: 10000 });
     const modelsOutput = modelsResult.output || "";
-    console.log(`[device-auth] models list output (${modelsOutput.length} chars): ${modelsOutput.slice(0, 500)}`);
+    console.log(`[codex-auth] models list output (${modelsOutput.length} chars): ${modelsOutput.slice(0, 500)}`);
     const codexModelLine = modelsOutput.split("\n").find(
       (l) => l.includes("openai-codex/") && !l.includes("(disabled)")
     );
@@ -587,23 +659,23 @@ async function writeDeviceAuthCredentials(tokens, email) {
       if (modelMatch) codexModel = modelMatch[1];
     }
   } catch (err) {
-    console.warn(`[device-auth] models list failed: ${err.message}`);
+    console.warn(`[codex-auth] models list failed: ${err.message}`);
   }
 
   if (!codexModel) {
     // Fall back to well-known model name
     codexModel = "openai-codex/gpt-5.2";
-    console.log(`[device-auth] No model discovered, using fallback: ${codexModel}`);
+    console.log(`[codex-auth] No model discovered, using fallback: ${codexModel}`);
   } else {
-    console.log(`[device-auth] Discovered model: ${codexModel}`);
+    console.log(`[codex-auth] Discovered model: ${codexModel}`);
   }
 
   // Set via both CLI and direct config (belt and suspenders)
   try {
     await runCmd(OPENCLAW_NODE, clawArgs(["models", "set", codexModel]));
-    console.log(`[device-auth] models set succeeded`);
+    console.log(`[codex-auth] models set succeeded`);
   } catch (err) {
-    console.warn(`[device-auth] models set failed: ${err.message}, setting config directly`);
+    console.warn(`[codex-auth] models set failed: ${err.message}, setting config directly`);
   }
 
   // Ensure agents.defaults.model.primary is set in config (matches working config structure)
@@ -618,7 +690,7 @@ async function writeDeviceAuthCredentials(tokens, email) {
   await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
 
   // Start the gateway (startGateway() no-ops if already running)
-  console.log(`[device-auth] Starting gateway...`);
+  console.log(`[codex-auth] Starting gateway...`);
   await startGateway();
 }
 
@@ -2261,6 +2333,174 @@ app.get("/setup/api/auth-groups", requireSetupAuth, async (_req, res) => {
   }
 });
 
+// ========== OAUTH REDIRECT (PASTE-BACK) ENDPOINTS ==========
+
+/**
+ * POST /setup/api/oauth/start - Initiate OpenAI Codex redirect OAuth flow
+ * Returns { sessionId, authUrl }
+ */
+app.post("/setup/api/oauth/start", requireSetupAuth, async (req, res) => {
+  const requestedProvider = (req.body?.provider || "").toString().toLowerCase();
+  const provider = requestedProvider === "codex-cli" ? "openai-codex" : requestedProvider;
+
+  if (provider !== "openai-codex") {
+    return res.status(400).json({
+      ok: false,
+      error: "Only openai-codex is supported for OAuth redirect",
+    });
+  }
+
+  const sessionId = crypto.randomUUID();
+  const { verifier, challenge } = createPkcePair();
+  const state = crypto.randomBytes(16).toString("hex");
+
+  const url = new URL(OPENAI_AUTHORIZE_URL);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("client_id", OPENAI_CLIENT_ID);
+  url.searchParams.set("redirect_uri", OPENAI_REDIRECT_URI);
+  url.searchParams.set("scope", OPENAI_SCOPE);
+  url.searchParams.set("code_challenge", challenge);
+  url.searchParams.set("code_challenge_method", "S256");
+  url.searchParams.set("state", state);
+  url.searchParams.set("id_token_add_organizations", "true");
+  url.searchParams.set("codex_cli_simplified_flow", "true");
+  url.searchParams.set("originator", "openclaw-wrapper");
+
+  oauthSessions.set(sessionId, {
+    id: sessionId,
+    status: "awaiting_callback",
+    authUrl: url.toString(),
+    state,
+    codeVerifier: verifier,
+    error: null,
+    result: null,
+    createdAt: Date.now(),
+  });
+
+  return res.json({
+    ok: true,
+    sessionId,
+    authUrl: url.toString(),
+  });
+});
+
+/**
+ * POST /setup/api/oauth/callback - Receive pasted redirect URL and finish exchange
+ */
+app.post("/setup/api/oauth/callback", requireSetupAuth, async (req, res) => {
+  const { sessionId, redirectUrl } = req.body || {};
+
+  if (!sessionId) {
+    return res.status(400).json({ ok: false, error: "Missing sessionId" });
+  }
+  if (!redirectUrl) {
+    return res.status(400).json({ ok: false, error: "Missing redirectUrl" });
+  }
+
+  const session = oauthSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ ok: false, error: "Unknown or expired session" });
+  }
+  if (session.status !== "awaiting_callback") {
+    return res.status(400).json({ ok: false, error: `Cannot accept callback in status ${session.status}` });
+  }
+
+  const parsed = parseOAuthRedirectInput(redirectUrl);
+  if (parsed.state && parsed.state !== session.state) {
+    session.status = "error";
+    session.error = "State mismatch";
+    return res.status(400).json({ ok: false, error: "State mismatch" });
+  }
+  if (!parsed.code) {
+    session.status = "error";
+    session.error = "Missing authorization code";
+    return res.status(400).json({ ok: false, error: "Missing authorization code" });
+  }
+
+  session.status = "exchanging";
+  try {
+    const tokenResp = await fetch(OPENAI_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: OPENAI_CLIENT_ID,
+        code: parsed.code,
+        code_verifier: session.codeVerifier,
+        redirect_uri: OPENAI_REDIRECT_URI,
+      }).toString(),
+    });
+
+    if (!tokenResp.ok) {
+      const text = await tokenResp.text().catch(() => "");
+      session.status = "error";
+      session.error = `Token exchange failed: ${tokenResp.status} ${text}`;
+      return res.status(500).json({ ok: false, error: session.error });
+    }
+
+    const json = await tokenResp.json();
+    const accessToken = json.access_token;
+    const refreshToken = json.refresh_token;
+    const idToken = json.id_token;
+    const expiresIn = typeof json.expires_in === "number" ? json.expires_in : undefined;
+
+    if (!accessToken || !refreshToken) {
+      session.status = "error";
+      session.error = "Token response missing access_token or refresh_token";
+      return res.status(500).json({ ok: false, error: session.error });
+    }
+
+    const tokens = {
+      accessToken,
+      refreshToken,
+      idToken,
+      expiresIn,
+      expiresAt: expiresIn ? Date.now() + expiresIn * 1000 : undefined,
+    };
+
+    const decoded = idToken ? decodeJwtPayload(idToken) : decodeJwtPayload(accessToken);
+    const email =
+      decoded?.email ||
+      decoded?.["https://api.openai.com/profile"]?.email ||
+      decoded?.["https://api.openai.com/auth"]?.chatgpt_account_id ||
+      "default";
+
+    await writeCodexAuthCredentials(tokens, email);
+
+    session.status = "done";
+    session.result = { profileId: "openai-codex:default", email };
+
+    return res.json({ ok: true, status: session.status, result: session.result });
+  } catch (err) {
+    session.status = "error";
+    session.error = String(err.message || err);
+    return res.status(500).json({ ok: false, error: session.error });
+  }
+});
+
+/**
+ * GET /setup/api/oauth/status - Poll OAuth flow status
+ */
+app.get("/setup/api/oauth/status", requireSetupAuth, async (req, res) => {
+  const sessionId = req.query.session;
+  if (!sessionId) {
+    return res.status(400).json({ ok: false, error: "Missing session query parameter" });
+  }
+
+  const session = oauthSessions.get(sessionId);
+  if (!session) {
+    return res.status(404).json({ ok: false, error: "Unknown or expired session" });
+  }
+
+  return res.json({
+    ok: true,
+    sessionId: session.id,
+    status: session.status,
+    error: session.error,
+    result: session.result,
+  });
+});
+
 // ========== DEVICE AUTH START ENDPOINT ==========
 
 /**
@@ -2366,11 +2606,11 @@ async function runDeviceAuthPollingLoop(session) {
                     "default";
 
       // Write credentials to openclaw config
-      await writeDeviceAuthCredentials(tokens, email);
+      await writeCodexAuthCredentials(tokens, email);
 
       session.status = "done";
       session.result = {
-        profileId: `openai-codex:${email}`,
+        profileId: "openai-codex:default",
         email,
       };
       console.log(`[device-auth] Session ${session.id}: Complete! Email: ${email}`);

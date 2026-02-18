@@ -621,6 +621,287 @@
     importButtonEl.onclick = importBackup;
   }
 
+  // ========== OAUTH REDIRECT FLOW ==========
+  var oauthCardEl = document.getElementById('oauthCard');
+  var oauthPrimaryLinkEl = document.getElementById('oauthPrimaryLink');
+  var oauthRefreshBtnEl = document.getElementById('oauthRefreshBtn');
+  var oauthCopyLinkBtnEl = document.getElementById('oauthCopyLinkBtn');
+  var oauthLinkStatusEl = document.getElementById('oauthLinkStatus');
+  var oauthStep2El = document.getElementById('oauthStep2');
+  var oauthStep3El = document.getElementById('oauthStep3');
+  var oauthRedirectUrlEl = document.getElementById('oauthRedirectUrl');
+  var oauthSubmitBtnEl = document.getElementById('oauthSubmitBtn');
+  var oauthCancelBtnEl = document.getElementById('oauthCancelBtn');
+  var oauthStatusTextEl = document.getElementById('oauthStatusText');
+  var oauthLogEl = document.getElementById('oauthLog');
+  var oauthSuccessTextEl = document.getElementById('oauthSuccessText');
+  var oauthErrorTextEl = document.getElementById('oauthErrorText');
+
+  var currentOAuthSession = null;
+  var oauthPollInterval = null;
+  var oauthAuthUrl = null;
+  var oauthStartPromise = null;
+
+  function ensureCodexSelected() {
+    showAllAuthMethods = true;
+    if (authGroupEl) {
+      authGroupEl.value = 'openai';
+      if (authGroupEl.onchange) authGroupEl.onchange();
+    }
+    if (authChoiceEl) {
+      var found = false;
+      for (var i = 0; i < authChoiceEl.options.length; i++) {
+        if (authChoiceEl.options[i].value === 'openai-codex') {
+          authChoiceEl.selectedIndex = i;
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        for (var j = 0; j < authChoiceEl.options.length; j++) {
+          if (authChoiceEl.options[j].value === 'codex-cli') {
+            authChoiceEl.selectedIndex = j;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  function oauthLog(msg) {
+    if (oauthLogEl) {
+      oauthLogEl.textContent += msg + '\n';
+      oauthLogEl.scrollTop = oauthLogEl.scrollHeight;
+    }
+  }
+
+  function setAuthLink(url) {
+    oauthAuthUrl = url || null;
+    if (oauthPrimaryLinkEl) {
+      oauthPrimaryLinkEl.href = oauthAuthUrl || '#';
+      oauthPrimaryLinkEl.classList.toggle('disabled', !oauthAuthUrl);
+      oauthPrimaryLinkEl.setAttribute('aria-disabled', oauthAuthUrl ? 'false' : 'true');
+    }
+    if (oauthLinkStatusEl) {
+      oauthLinkStatusEl.textContent = oauthAuthUrl ? oauthAuthUrl : 'Sign-in link will appear here';
+    }
+    if (oauthCopyLinkBtnEl) {
+      oauthCopyLinkBtnEl.disabled = !oauthAuthUrl;
+    }
+  }
+
+  function stopOAuthPolling() {
+    if (oauthPollInterval) {
+      clearInterval(oauthPollInterval);
+      oauthPollInterval = null;
+    }
+  }
+
+  function resetOAuthStatus() {
+    stopOAuthPolling();
+    if (oauthStep2El) oauthStep2El.style.display = 'block';
+    if (oauthSuccessTextEl) oauthSuccessTextEl.style.display = 'none';
+    if (oauthErrorTextEl) {
+      oauthErrorTextEl.style.display = 'none';
+      oauthErrorTextEl.textContent = '';
+    }
+  }
+
+  async function startOAuthFlow(force) {
+    if (!force && oauthAuthUrl) return;
+    if (oauthStartPromise) return oauthStartPromise;
+
+    oauthStartPromise = (async () => {
+      ensureCodexSelected();
+      stopOAuthPolling();
+      currentOAuthSession = null;
+      setAuthLink(null);
+      if (oauthStatusTextEl) oauthStatusTextEl.textContent = 'Requesting sign-in link...';
+      oauthLog('Requesting OAuth redirect link...');
+
+      try {
+        var resp = await httpJson('/setup/api/oauth/start', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ provider: 'openai-codex' }),
+        });
+
+        if (!resp.ok) {
+          throw new Error(resp.error || 'Failed to start OAuth');
+        }
+
+        currentOAuthSession = resp.sessionId;
+        setAuthLink(resp.authUrl);
+        if (oauthStatusTextEl) oauthStatusTextEl.textContent = 'Sign-in link ready';
+        if (oauthStep2El) oauthStep2El.style.display = 'block';
+        if (oauthStep3El) oauthStep3El.style.display = 'none';
+        oauthLog('Session: ' + resp.sessionId);
+      } catch (err) {
+        oauthLog('Error: ' + err);
+        if (oauthStatusTextEl) oauthStatusTextEl.textContent = 'Failed to create link: ' + err;
+        setAuthLink(null);
+        throw err;
+      } finally {
+        oauthStartPromise = null;
+      }
+    })();
+
+    return oauthStartPromise;
+  }
+
+  async function submitOAuthCallback() {
+    if (!currentOAuthSession) {
+      oauthLog('Error: No active OAuth session. Get a new link.');
+      return;
+    }
+    var url = (oauthRedirectUrlEl && oauthRedirectUrlEl.value || '').trim();
+    if (!url) {
+      oauthLog('Error: Please paste the redirect URL.');
+      return;
+    }
+
+    if (oauthSubmitBtnEl) {
+      oauthSubmitBtnEl.disabled = true;
+      oauthSubmitBtnEl.textContent = 'Submitting...';
+    }
+
+    try {
+      var resp = await httpJson('/setup/api/oauth/callback', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: currentOAuthSession, redirectUrl: url }),
+      });
+
+      if (!resp.ok) {
+        throw new Error(resp.error || 'Failed to submit callback');
+      }
+
+      oauthLog('Callback accepted. Exchanging tokens...');
+      if (oauthStatusTextEl) oauthStatusTextEl.textContent = 'Exchanging tokens...';
+      resetOAuthStatus();
+      startOAuthPolling();
+    } catch (e) {
+      oauthLog('Error: ' + String(e));
+      if (oauthStatusTextEl) oauthStatusTextEl.textContent = 'Error: ' + String(e);
+    } finally {
+      if (oauthSubmitBtnEl) {
+        oauthSubmitBtnEl.disabled = false;
+        oauthSubmitBtnEl.textContent = 'Submit URL';
+      }
+    }
+  }
+
+  function startOAuthPolling() {
+    stopOAuthPolling();
+    var pollCount = 0;
+    var maxPolls = 90; // ~3 minutes at 2s
+
+    oauthPollInterval = setInterval(async function () {
+      pollCount++;
+      if (pollCount > maxPolls) {
+        stopOAuthPolling();
+        oauthLog('Timeout waiting for OAuth completion.');
+        if (oauthStatusTextEl) oauthStatusTextEl.textContent = 'Timeout. Please get a new link.';
+        return;
+      }
+
+      try {
+        var resp = await httpJson('/setup/api/oauth/status?session=' + currentOAuthSession);
+        if (oauthStatusTextEl) oauthStatusTextEl.textContent = 'Status: ' + resp.status;
+
+        if (resp.status === 'done') {
+          stopOAuthPolling();
+          if (oauthStep2El) oauthStep2El.style.display = 'none';
+          if (oauthStep3El) oauthStep3El.style.display = 'block';
+          if (oauthSuccessTextEl) oauthSuccessTextEl.style.display = 'block';
+          if (oauthErrorTextEl) oauthErrorTextEl.style.display = 'none';
+          oauthLog('OAuth complete. Gateway is starting...');
+          setTimeout(function () {
+            refreshStatus();
+            if (oauthCardEl) oauthCardEl.style.display = 'none';
+          }, 2000);
+        } else if (resp.status === 'error') {
+          stopOAuthPolling();
+          if (oauthStep2El) oauthStep2El.style.display = 'none';
+          if (oauthStep3El) oauthStep3El.style.display = 'block';
+          if (oauthSuccessTextEl) oauthSuccessTextEl.style.display = 'none';
+          if (oauthErrorTextEl) {
+            oauthErrorTextEl.style.display = 'block';
+            oauthErrorTextEl.textContent = resp.error || 'Authentication failed';
+          }
+          oauthLog('Error: ' + (resp.error || 'Authentication failed'));
+        }
+      } catch (e) {
+        oauthLog('Poll error: ' + String(e));
+      }
+    }, 2000);
+  }
+
+  if (oauthPrimaryLinkEl) {
+    oauthPrimaryLinkEl.onclick = function (e) {
+      if (!oauthAuthUrl) {
+        e.preventDefault();
+        oauthLog('Link is not ready yet. Preparing...');
+        startOAuthFlow().catch(() => {});
+        return false;
+      }
+      return true;
+    };
+  }
+
+  if (oauthRefreshBtnEl) {
+    oauthRefreshBtnEl.onclick = function () {
+      startOAuthFlow(true).catch(() => {});
+    };
+  }
+
+  if (oauthCopyLinkBtnEl) {
+    oauthCopyLinkBtnEl.onclick = function () {
+      if (!oauthAuthUrl) return;
+      navigator.clipboard.writeText(oauthAuthUrl);
+      oauthLog('Sign-in link copied to clipboard');
+    };
+  }
+
+  if (oauthSubmitBtnEl) {
+    oauthSubmitBtnEl.onclick = submitOAuthCallback;
+  }
+
+  if (oauthCancelBtnEl) {
+    oauthCancelBtnEl.onclick = function () {
+      stopOAuthPolling();
+      currentOAuthSession = null;
+      setAuthLink(null);
+      if (oauthStep2El) oauthStep2El.style.display = 'block';
+      if (oauthStep3El) oauthStep3El.style.display = 'none';
+      if (oauthStatusTextEl) oauthStatusTextEl.textContent = 'Cancelled. Get a new link to restart.';
+    };
+  }
+
+  if (oauthRedirectUrlEl) {
+    oauthRedirectUrlEl.onkeydown = function (e) {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        submitOAuthCallback();
+      }
+    };
+  }
+
+  // Device flow link (secondary)
+  var deviceFlowLinkEl = document.getElementById('deviceFlowLink');
+  if (deviceFlowLinkEl) {
+    deviceFlowLinkEl.onclick = function (e) {
+      e.preventDefault();
+      ensureCodexSelected();
+      showDeviceAuthCard('OpenAI Codex');
+      if (deviceAuthCardEl && deviceAuthCardEl.scrollIntoView) {
+        deviceAuthCardEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    };
+  }
+
+  startOAuthFlow().catch(() => {});
+
   // ========== DEVICE AUTH FLOW ==========
   var deviceAuthCardEl = document.getElementById('deviceAuthCard');
   var deviceAuthStep1El = document.getElementById('deviceAuthStep1');

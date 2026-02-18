@@ -103,6 +103,17 @@
   <div class="card">
     <h2>1) Model/auth provider</h2>
     <p class="muted">Matches the groups shown in the terminal onboarding.</p>
+
+    <div id="codexOAuthCta" class="inline-cta">
+      <div class="cta-actions">
+        <button id="oauthStartPrimaryBtn">Sign in with ChatGPT (OpenAI Codex)</button>
+        <button id="deviceFlowLink" class="link-button">Use device code instead (ChatGPT Plus advanced toggle)</button>
+      </div>
+      <p class="muted" style="margin-top: 0.25rem;">
+        Preferred path. Opens a browser tab, then paste back the 127.0.0.1:1455 redirect URL if prompted.
+      </p>
+    </div>
+
     <label>Provider group</label>
     <select id="authGroup">
       <option value="">Select provider group...</option>
@@ -124,12 +135,46 @@
     </select>
   </div>
 
+  <div class="card" id="oauthCard">
+    <h2>OpenAI Codex OAuth (redirect)</h2>
+    <p class="muted">Primary path. Get a link, open it in any browser (even on another device), then paste back the localhost callback URL.</p>
+
+    <div class="oauth-link-row">
+      <a id="oauthPrimaryLink" class="primary-link disabled" href="#" target="_blank" rel="noopener">Sign in with ChatGPT (OpenAI Codex)</a>
+      <button id="oauthRefreshBtn" class="tertiary-button">Get new link</button>
+      <button id="oauthCopyLinkBtn" class="secondary-button" disabled>Copy link</button>
+    </div>
+    <div id="oauthLinkStatus" class="oauth-link-status">Sign-in link will appear here</div>
+
+    <div id="oauthStep2" style="display: block; margin-top: 1rem;">
+      <p class="muted">
+        1) The link opens a tab and redirects to <code>http://localhost:1455/auth/callback</code> after login (it will show a "connection refused" error).<br/>
+        2) Copy the entire URL from your browser's address bar<br/>
+        3) Paste it below and submit.
+      </p>
+      <label>Redirect URL</label>
+      <input id="oauthRedirectUrl" type="text" placeholder="http://localhost:1455/auth/callback?code=...&state=..." />
+      <div class="muted" style="margin-top: 0.25rem;">We only use the code/state in this URL. Never share it elsewhere.</div>
+      <div style="margin-top: 0.75rem; display: flex; gap: 0.5rem; flex-wrap: wrap;">
+        <button id="oauthSubmitBtn">Submit URL</button>
+        <button id="oauthCancelBtn" class="tertiary-button">Cancel</button>
+      </div>
+      <div class="muted" id="oauthStatusText" style="margin-top: 0.5rem;"></div>
+      <pre id="oauthLog" class="log-box"></pre>
+    </div>
+
+    <div id="oauthStep3" style="display: none; margin-top: 1rem;">
+      <p id="oauthSuccessText" class="success-text">Signed in successfully. Gateway is starting...</p>
+      <p id="oauthErrorText" class="error-text" style="display: none;"></p>
+    </div>
+  </div>
+
   <div class="card" id="deviceAuthCard" style="display: none;">
     <h2>Sign in with ChatGPT</h2>
 
     <div id="deviceAuthStep1">
       <p>You selected <strong id="deviceAuthProviderName">OpenAI Codex</strong> which uses ChatGPT OAuth.</p>
-      <p class="muted">Click below to get a one-time code, then enter it at OpenAI's sign-in page.</p>
+      <p class="muted">Requires ChatGPT Plus “Advanced” toggle. Click below to get a one-time code, then enter it at OpenAI's sign-in page.</p>
       <button id="deviceAuthStartBtn">Get Sign-in Code</button>
     </div>
 
